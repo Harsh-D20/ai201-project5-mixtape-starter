@@ -337,3 +337,7 @@ return [song.to_dict() for song in songs]
 4. Confirmed via `git diff --stat` that only `services/playlist_service.py` was modified, by exactly one line.
 
 `get_playlist_songs` is only called from `routes/playlists.py`'s `GET /playlists/<id>/songs` endpoint and isn't reused elsewhere, so the fix has no effect outside that one response path.
+
+## Git Log
+
+![Git log](gitlog.png)
