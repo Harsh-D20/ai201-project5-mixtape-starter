@@ -1,5 +1,19 @@
 # Submission
 
+## AI Usage
+
+I used Claude Code (Sonnet) throughout this project as a pair for navigation, debugging, and documentation — not as a source of unverified fixes.
+
+**Codebase navigation.** I asked it to read through `app.py`, `models.py`, every file in `routes/` and `services/`, and the tests, then explain the layering (routes → services → models), how blueprints are wired up in the app factory, and how the association tables (`friendships`, `song_tags`, `playlist_entries`) work. It also traced a full request end-to-end (adding a song to a playlist → `notification_service.add_to_playlist` → `create_notification`) to show how a route can hand off to a service other than its "own" one. This was faster than manually cross-referencing five files by hand and is what the Codebase Map and data-flow write-up below are based on.
+
+**Debugging.** For each bug, I had it follow a fixed process: reproduce the symptom first (via the existing failing pytest test and, where useful, a standalone script), only then explain the root cause by diffing the code against its own docstring/spec, apply the smallest fix, and re-run the full suite to check for regressions. This caught things I likely would have rushed past — e.g., for the search-duplicates bug, the existing test suite was already green, and a shallower check might have concluded there was no bug. Instead it dug in with `.count()` and SQLAlchemy's 2.0-style `select()` API and showed the join really does produce duplicate rows at the SQL level, and that the tests were only passing because of an implicit, version-dependent dedup behavior in the legacy ORM `Query` API — not because the query was actually correct.
+
+**Where I verified or overrode its output.** I didn't treat any root-cause explanation or "fixed" claim as final without seeing it demonstrated:
+- Every bug fix was checked against a live re-run of the relevant pytest file plus the full suite (`pytest tests/`), not just the assistant's description of what should happen.
+- For the streak and search bugs, I had it write small standalone repro scripts (e.g., simulating two weeks of daily listens) so I could see the actual before/after numbers rather than relying on a written summary.
+- I used `git diff --stat` after each fix to confirm the change was scoped to exactly the file(s) it claimed to touch, since a plausible-sounding "root cause" is only useful if the actual diff matches it.
+- I independently noted the two pre-existing `test_playlists.py` failures (from the last-song-missing bug) and made sure later fixes didn't silently piggyback on or mask that unrelated issue before it was actually fixed.
+
 ## Codebase Map
 
 | File | Responsibility |
