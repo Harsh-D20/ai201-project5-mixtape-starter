@@ -148,3 +148,103 @@ elif days_since_last == 1:
    - `tests/test_playlists.py` — 1 of 3 tests pass; the other two (`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`) fail, but this is **pre-existing and unrelated** — it's Issue #5 ("the last song in a playlist never shows up"), which lives entirely in `services/playlist_service.py`, a file this change never touches. Confirmed via `git diff --stat` that only `services/streak_service.py` was modified.
 
 No other code path reads `today.weekday()` or depends on this branch, and the change is a strict one-line removal of an incorrect condition, so there is no risk beyond the streak-update logic itself.
+
+## Bug Fix 3
+### How I reproduced the error
+
+`tests/test_search.py` already has a fixture (`seed_songs`) that creates a song with three tags specifically to target this bug, and a test for it:
+
+```python
+def test_search_no_duplicates_multi_tag_song(app, seed_songs):
+    """
+    A song with multiple tags should appear exactly once in search results.
+    """
+    with app.app_context():
+        results = search_songs("Crown Heights")
+        matching = [r for r in results if r["title"] == "Crown Heights Anthem"]
+        assert len(matching) == 1  # Should be 1, bug causes it to be 3
+```
+
+Running `pytest tests/test_search.py -v` showed this test (and all others) **passing** even before my fix — so the bug does not manifest through `search_songs()`'s own return value in this environment. To find out why, and whether the underlying query was still broken, I queried the same filter two different ways against a song with 3 tags:
+
+```python
+q = db.session.query(Song).outerjoin(song_tags, Song.id == song_tags.c.song_id).filter(...)
+print(".all() length:", len(q.all()))      # -> 1
+print(".count() value:", q.count())        # -> 3
+```
+
+`.all()` reported 1 song, but `.count()` — which runs `SELECT count(*)` against the exact same joined query instead of materializing ORM entities — reported **3**. I confirmed this with raw SQL and with SQLAlchemy's 2.0-style `select()`/`session.execute()` API (which doesn't get the same treatment as the legacy `Query` object):
+
+```python
+stmt = select(Song).outerjoin(song_tags, Song.id == song_tags.c.song_id).where(Song.title.ilike("%Crown Heights%"))
+rows = db.session.execute(stmt).scalars().all()
+print(len(rows))  # -> 3
+```
+
+This confirmed the query genuinely produces 3 duplicate rows at the SQL level for a song with 3 tags — the join fans out one row per matching `song_tags` entry. The reason `search_songs()`'s own tests don't currently catch it is that SQLAlchemy's legacy `Query.all()` API (used by `db.session.query(...)`) implicitly de-duplicates full-entity results by primary key, silently papering over the row multiplication. That's an accidental, version-dependent safety net, not something the code does on purpose, and it doesn't protect `.count()`, raw SQL, or the modern `select()` API — all of which still show the real duplication that produces the reported "same song shows up twice" symptom.
+
+### How I found the root cause
+
+I looked at what the join was actually for. `search_songs`'s filter only checks `Song.title` and `Song.artist`:
+
+```python
+.filter(
+    db.or_(
+        Song.title.ilike(f"%{query}%"),
+        Song.artist.ilike(f"%{query}%"),
+    )
+)
+```
+
+Nothing in the filter references `song_tags` or `Tag` at all — the join contributes nothing to which songs match the search. Its only effect is structural: `Song` LEFT OUTER JOIN `song_tags` produces one output row per matching `song_tags` row for a given song, so a song with 3 tags contributes 3 identical `Song` rows to the result set instead of 1. Separately, `models.py` already defines `tags = db.relationship("Tag", secondary=song_tags, lazy="subquery")` on `Song`, which loads a song's tags via its own separate query whenever `song.to_dict()` accesses `self.tags` — so the manual join in `search_service.py` was never needed to populate the `tags` field in the response either. The join is dead weight that does nothing but multiply rows.
+
+### Root cause
+
+`services/search_service.py`, in `search_songs` (before fix):
+
+```python
+results = (
+    db.session.query(Song)
+    .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+    .filter(
+        db.or_(
+            Song.title.ilike(f"%{query}%"),
+            Song.artist.ilike(f"%{query}%"),
+        )
+    )
+    .all()
+)
+```
+
+An unnecessary `outerjoin` against the `song_tags` association table was added to a query whose filter never uses it. Because `song_tags` has one row per (song, tag) pair, joining against it fans a song with N tags out into N duplicate rows. The code "worked" in this codebase's test suite only because SQLAlchemy's legacy `Query.all()` happens to collapse duplicate full-entity rows back down by primary key — a quirk of that specific API, not a property of the query itself, as shown by `.count()` and the 2.0-style `select()` API returning the true, duplicated count.
+
+### How I solved it and tested for side effects
+
+**Fix** — remove the unnecessary join (and its now-unused `Tag`/`song_tags` imports), since it was never used for filtering and tags are already loaded via the `Song.tags` relationship:
+
+```python
+from app import db
+from models import Song
+
+...
+
+results = (
+    db.session.query(Song)
+    .filter(
+        db.or_(
+            Song.title.ilike(f"%{query}%"),
+            Song.artist.ilike(f"%{query}%"),
+        )
+    )
+    .all()
+)
+```
+
+**Testing:**
+
+1. Re-ran the `.all()` / `.count()` / 2.0-style `select()` comparison from the reproduction step against the same 3-tag song — all three now agree and return **1**, confirming the duplication is gone at the SQL level, not just hidden by ORM-version behavior.
+2. Ran `pytest tests/test_search.py -v` — all 5 tests still pass, including `test_search_no_duplicates_multi_tag_song`.
+3. Ran the full suite (`pytest tests/ -v`) to check for side effects: `tests/test_streaks.py` — all 5 pass (unaffected, different module). `tests/test_playlists.py` — same 2 pre-existing failures as before (`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`), which are Issue #5 in `services/playlist_service.py`, untouched by this change.
+4. Confirmed via `git diff --stat` that only `services/search_service.py` was modified (one join removed, two now-unused imports dropped).
+
+No other code reads or joins against `song_tags` inside `search_service.py`, and `Song.tags` (used by `to_dict()`) is unaffected since it's loaded independently via its own relationship strategy — so there's no risk beyond the search query itself.
