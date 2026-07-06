@@ -178,6 +178,7 @@ def seed():
         db.session.commit()
         print("Seed data created successfully.")
         print(f"  Users: {len(users)}")
+        print(f"  IDs: {[u.id for u in users]}")
         print(f"  Songs: {len(all_songs)}")
         print(f"  Playlists: {len(playlists)}")
         print(f"  Tags: {len(tags)}")
