@@ -248,3 +248,78 @@ results = (
 4. Confirmed via `git diff --stat` that only `services/search_service.py` was modified (one join removed, two now-unused imports dropped).
 
 No other code reads or joins against `song_tags` inside `search_service.py`, and `Song.tags` (used by `to_dict()`) is unaffected since it's loaded independently via its own relationship strategy — so there's no risk beyond the search query itself.
+
+## Bug Fix 5
+### How I reproduced the error
+
+`tests/test_playlists.py` already has a fixture that seeds a playlist with exactly 5 songs at positions 1–5, and two tests built around it:
+
+```python
+def test_playlist_returns_all_songs(app, seed_playlist):
+    """
+    get_playlist_songs should return all songs in the playlist.
+    """
+    with app.app_context():
+        playlist_id = seed_playlist["playlist"].id
+        songs = get_playlist_songs(playlist_id)
+        assert len(songs) == 5  # Bug causes this to return 4
+```
+
+Running `pytest tests/test_playlists.py -v` confirmed the bug exactly as commented:
+
+```
+tests/test_playlists.py::test_playlist_returns_all_songs FAILED
+E       AssertionError: assert 4 == 5
+E        +  where 4 = len([... 'Track 1' ..., 'Track 2', 'Track 3', 'Track 4'])
+
+tests/test_playlists.py::test_playlist_returns_songs_in_order FAILED
+E       AssertionError: assert ['Track 1', ..., 'Track 4'] == ['Track 1', ..., 'Track 4', 'Track 5']
+E       Right contains one more item: 'Track 5'
+```
+
+Both failures show the same shape: `Track 5` — the last song by position — is missing from the result, while `Track 1`–`4` come back fine and in the correct order. `test_empty_playlist_returns_empty_list` already passed, which narrowed things further: the function doesn't crash on an empty list, it just drops one real entry off the end of a non-empty one.
+
+### How I found the root cause
+
+Since the songs that do come back are correctly ordered and correctly shaped, the bug isn't in the query — it's in whatever happens to the query's result afterward. Reading `get_playlist_songs` in `services/playlist_service.py` top to bottom, the query builds `songs` ordered ascending by position (correct), and then the return statement does something to that list before converting to dicts:
+
+```python
+songs = (
+    db.session.query(Song)
+    .join(playlist_entries, Song.id == playlist_entries.c.song_id)
+    .filter(playlist_entries.c.playlist_id == playlist_id)
+    .order_by(asc(playlist_entries.c.position))
+    .all()
+)
+
+return [song.to_dict() for song in songs[:-1]]
+```
+
+`songs[:-1]` slices off the last element of whatever list `songs` is — regardless of playlist length. For a 5-song playlist ordered by position, that unconditionally drops the 5th (last-positioned) song, matching the exact symptom in the issue title ("the last song in a playlist never shows up") and in both failing tests. The function's own docstring even says "This function returns all songs in the playlist," directly contradicting what the code does.
+
+### Root cause
+
+`services/playlist_service.py`, in `get_playlist_songs` (before fix):
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+An off-by-one slice (`songs[:-1]`) drops the last song in the already-correctly-ordered `songs` list before serializing. This isn't conditional on playlist size or any edge case — every non-empty playlist loses its final song, permanently.
+
+### How I solved it and tested for side effects
+
+**Fix** — serialize the full, correctly-ordered list instead of slicing off the last entry:
+
+```python
+return [song.to_dict() for song in songs]
+```
+
+**Testing:**
+
+1. Ran `pytest tests/test_playlists.py -v` — all 3 tests now pass, including `test_playlist_returns_all_songs` (now returns 5) and `test_playlist_returns_songs_in_order` (now includes `Track 5` in the correct position).
+2. Confirmed the empty-playlist case still works: `test_empty_playlist_returns_empty_list` passes — `[][:-1]` and `[]` are both empty, so this edge case was never actually broken, only the non-empty case was.
+3. Ran the full suite (`pytest tests/ -v`) — all 13 tests pass, including `tests/test_search.py` (5) and `tests/test_streaks.py` (5), confirming no regressions in unrelated modules.
+4. Confirmed via `git diff --stat` that only `services/playlist_service.py` was modified, by exactly one line.
+
+`get_playlist_songs` is only called from `routes/playlists.py`'s `GET /playlists/<id>/songs` endpoint and isn't reused elsewhere, so the fix has no effect outside that one response path.
